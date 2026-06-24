@@ -10,41 +10,61 @@ import xgboost as xgb
 class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
     """
     Custom Transformer thực hiện toàn bộ quá trình Feature Engineering 
-    từ file return_prediction_fe.ipynb.
+    từ file return_prediction_fe.ipynb một cách sạch sẽ, không bị Data Leakage.
     """
     def __init__(self, df_order_items, df_returns, df_products, df_customers, df_reviews, df_geography):
         # Nhận các bảng phụ làm tham số khởi tạo
-        self.df_order_items = df_order_items
-        self.df_returns = df_returns
-        self.df_products = df_products
-        self.df_customers = df_customers
-        self.df_reviews = df_reviews
-        self.df_geography = df_geography
+        self.df_order_items = df_order_items.copy()
+        self.df_returns = df_returns.copy()
+        self.df_products = df_products.copy()
+        self.df_customers = df_customers.copy()
+        self.df_reviews = df_reviews.copy()
+        self.df_geography = df_geography.copy()
+        self.train_orders = None
+
+        # Parse dates
+        self.df_returns['return_date'] = pd.to_datetime(self.df_returns['return_date'])
+        self.df_reviews['review_date'] = pd.to_datetime(self.df_reviews['review_date'])
+        self.df_customers['signup_date'] = pd.to_datetime(self.df_customers['signup_date'])
 
     def fit(self, X, y=None):
-        # Trong Pipeline chuẩn, fit dùng để tính toán các tham số từ tập train.
-        # Ở đây, logic tính toán cumulative (leakage-safe) đang được thực hiện chung trên toàn tập dữ liệu
-        # trong quá trình transform, nên ta chỉ cần pass. 
-        # (Lưu ý: Để deploy thực tế online serving, bạn cần lưu trữ state của tập train tại đây).
+        # Lưu trữ thông tin orders từ tập train để phục vụ transform tập test/val
+        self.train_orders = X[['order_id', 'order_date', 'customer_id', 'zip', 'payment_method', 'order_source']].copy()
+        self.train_orders['order_date'] = pd.to_datetime(self.train_orders['order_date'])
         return self
 
     def transform(self, X):
         """
-        X: df_orders (bảng đơn hàng gốc)
+        X: df_orders (bảng đơn hàng cần dự đoán)
         """
-        df_base = X.copy()
+        X_base = X.copy()
+        X_base['order_date'] = pd.to_datetime(X_base['order_date'])
         
-        # 1. Nhóm 1: Order Composition
-        df_items = self.df_order_items.merge(self.df_products, on='product_id', how='left')
-        df_items['line_total'] = df_items['quantity'] * df_items['unit_price'] - df_items['discount_amount']
-        df_items['has_discount'] = (df_items['discount_amount'] > 0).astype(int)
-        df_items['has_promo'] = df_items['promo_id'].notna().astype(int)
+        # Kết hợp tập orders train đã lưu và batch hiện tại
+        if self.train_orders is not None:
+            all_orders = pd.concat([
+                self.train_orders, 
+                X_base[['order_id', 'order_date', 'customer_id', 'zip', 'payment_method', 'order_source']]
+            ]).drop_duplicates(subset=['order_id'])
+        else:
+            all_orders = X_base[['order_id', 'order_date', 'customer_id', 'zip', 'payment_method', 'order_source']].copy()
+            
+        all_orders['order_date'] = pd.to_datetime(all_orders['order_date'])
+
+        # ── 1. Order Composition & Aggregates ─────────────────────────────
+        df_items_all = self.df_order_items.merge(self.df_products, on='product_id', how='left')
+        # Lọc chỉ lấy các items thuộc những orders ta biết
+        df_items_all = df_items_all[df_items_all['order_id'].isin(all_orders['order_id'])].copy()
+        
+        df_items_all['line_total'] = df_items_all['quantity'] * df_items_all['unit_price'] - df_items_all['discount_amount']
+        df_items_all['has_discount'] = (df_items_all['discount_amount'] > 0).astype(int)
+        df_items_all['has_promo'] = df_items_all['promo_id'].notna().astype(int)
         
         size_map = {'S': 1, 'M': 2, 'L': 3, 'XL': 4}
-        df_items['size_ordinal'] = df_items['size'].map(size_map)
-        df_items['product_margin'] = (df_items['price'] - df_items['cogs']) / df_items['price'].clip(lower=1)
+        df_items_all['size_ordinal'] = df_items_all['size'].map(size_map)
+        df_items_all['product_margin'] = (df_items_all['price'] - df_items_all['cogs']) / df_items_all['price'].clip(lower=1)
         
-        order_agg = df_items.groupby('order_id').agg(
+        order_agg = df_items_all.groupby('order_id').agg(
             n_products=('product_id', 'nunique'),
             n_items=('quantity', 'sum'),
             n_categories=('category', 'nunique'),
@@ -68,92 +88,274 @@ class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
         
         order_agg['std_unit_price'] = order_agg['std_unit_price'].fillna(0)
         
-        price_range_df = df_items.groupby('order_id')['unit_price'].agg(price_max='max', price_min='min').reset_index()
+        price_range_df = df_items_all.groupby('order_id')['unit_price'].agg(price_max='max', price_min='min').reset_index()
         price_range_df['price_range'] = price_range_df['price_max'] - price_range_df['price_min']
         order_agg = order_agg.merge(price_range_df[['order_id', 'price_range']], on='order_id', how='left')
         
         order_agg['discount_pct'] = order_agg['total_discount'] / (order_agg['order_total_value'] + order_agg['total_discount']).clip(lower=1)
         
-        df_base = df_base.merge(order_agg, on='order_id', how='left')
+        # Dominant Category & Segment
+        dominant_cat = df_items_all.groupby('order_id')['category'].agg(lambda x: x.mode().iloc[0] if len(x) > 0 else 'unknown').reset_index(name='dominant_category')
+        dominant_seg = df_items_all.groupby('order_id')['segment'].agg(lambda x: x.mode().iloc[0] if len(x) > 0 else 'unknown').reset_index(name='dominant_segment')
         
-        # 2. Dominant Category & Segment
-        dominant_cat = df_items.groupby('order_id')['category'].agg(lambda x: x.mode().iloc[0] if len(x) > 0 else 'unknown').reset_index(name='dominant_category')
-        dominant_seg = df_items.groupby('order_id')['segment'].agg(lambda x: x.mode().iloc[0] if len(x) > 0 else 'unknown').reset_index(name='dominant_segment')
-        df_base = df_base.merge(dominant_cat, on='order_id', how='left').merge(dominant_seg, on='order_id', how='left')
-        
-        # 3. Product Historical Return (Lưu ý: trong pipeline lý tưởng nên tính từ fit)
-        # Tạo bảng: order_id -> order_date
-        order_dates = df_base[['order_id', 'order_date']].copy()
+        # Ghép thông tin tĩnh vào all_orders_agg
+        all_orders_agg = all_orders.merge(order_agg, on='order_id', how='left')
+        all_orders_agg = all_orders_agg.merge(dominant_cat, on='order_id', how='left')
+        all_orders_agg = all_orders_agg.merge(dominant_seg, on='order_id', how='left')
+        all_orders_agg = all_orders_agg.merge(self.df_geography[['zip', 'region']], on='zip', how='left')
 
-        # Tạo bảng return history cho mỗi product
-        items_with_date = self.df_order_items.merge(order_dates, on='order_id', how='inner')
-        items_with_date = items_with_date.merge(
-            self.df_returns[['order_id', 'product_id']].drop_duplicates().assign(was_returned=1),
-            on=['order_id', 'product_id'], how='left'
+        # ── 2. Product Historical Returns (Leakage-free) ──────────────────
+        # Tính toán cumulative orders của từng product theo dòng thời gian
+        all_prod_orders = self.df_order_items[['order_id', 'product_id']].merge(
+            all_orders[['order_id', 'order_date']], on='order_id', how='inner'
         )
-        items_with_date['was_returned'] = items_with_date['was_returned'].fillna(0).astype(int)
-        items_with_date = items_with_date.sort_values('order_date')
+        all_prod_orders['order_date'] = pd.to_datetime(all_prod_orders['order_date'])
+        
+        prod_daily_orders = all_prod_orders.groupby(['product_id', 'order_date']).size().reset_index(name='daily_count')
+        prod_daily_orders = prod_daily_orders.sort_values(['product_id', 'order_date'])
+        prod_daily_orders['cum_orders'] = prod_daily_orders.groupby('product_id')['daily_count'].cumsum()
+        prod_daily_orders['cum_orders_before'] = prod_daily_orders.groupby('product_id')['cum_orders'].shift(1).fillna(0)
 
-        # Cumulative return rate per product (leakage-safe)
-        items_with_date['prod_cum_returns'] = items_with_date.groupby('product_id')['was_returned'].cumsum()
-        items_with_date['prod_cum_returns'] = items_with_date.groupby('product_id')['prod_cum_returns'].shift(1).fillna(0)
-        items_with_date['prod_cum_total'] = items_with_date.groupby('product_id').cumcount()
-        items_with_date['prod_hist_return_rate'] = items_with_date['prod_cum_returns'] / items_with_date['prod_cum_total'].clip(lower=1)
+        # Tính toán cumulative returns của từng product theo ngày trả thực tế
+        prod_returns_df = self.df_returns[['product_id', 'return_date']].dropna().copy()
+        prod_returns_df['return_date'] = pd.to_datetime(prod_returns_df['return_date'])
+        prod_returns_daily = prod_returns_df.groupby(['product_id', 'return_date']).size().reset_index(name='daily_returns')
+        prod_returns_daily = prod_returns_daily.sort_values(['product_id', 'return_date'])
+        prod_returns_daily['cum_returns'] = prod_returns_daily.groupby('product_id')['daily_returns'].cumsum()
 
-        # Aggregate product historical return rates lên cấp order
-        order_prod_hist = items_with_date.groupby('order_id').agg(
+        # Tạo tập items cho riêng X_base để merge asof
+        X_items = self.df_order_items[['order_id', 'product_id']].merge(
+            X_base[['order_id', 'order_date']], on='order_id', how='inner'
+        )
+        X_items['order_date'] = pd.to_datetime(X_items['order_date'])
+        
+        # Merge số đơn đặt trước ngày order_date
+        X_items = X_items.merge(
+            prod_daily_orders[['product_id', 'order_date', 'cum_orders_before']],
+            on=['product_id', 'order_date'],
+            how='left'
+        )
+        X_items['cum_orders_before'] = X_items['cum_orders_before'].fillna(0)
+
+        # Merge số lượt trả thực tế trước ngày order_date (dùng merge_asof)
+        X_items = X_items.sort_values('order_date')
+        prod_returns_daily_sorted = prod_returns_daily[['product_id', 'return_date', 'cum_returns']].sort_values('return_date')
+        X_items = pd.merge_asof(
+            X_items,
+            prod_returns_daily_sorted,
+            left_on='order_date',
+            right_on='return_date',
+            by='product_id',
+            direction='backward',
+            allow_exact_matches=False
+        )
+        X_items['cum_returns'] = X_items['cum_returns'].fillna(0)
+        X_items['prod_hist_return_rate'] = X_items['cum_returns'] / X_items['cum_orders_before'].clip(lower=1)
+
+        # Group lên cấp order_id
+        order_prod_hist = X_items.groupby('order_id').agg(
             avg_prod_hist_return_rate=('prod_hist_return_rate', 'mean'),
             max_prod_hist_return_rate=('prod_hist_return_rate', 'max'),
-            sum_prod_hist_returns=('prod_cum_returns', 'sum'),
+            sum_prod_hist_returns=('cum_returns', 'sum')
         ).reset_index()
 
+        # ── 3. Customer Features (Leakage-free) ───────────────────────────
+        all_orders_agg = all_orders_agg.sort_values('order_date')
+        cust_daily = all_orders_agg.groupby(['customer_id', 'order_date']).agg(
+            daily_count=('order_id', 'count'),
+            daily_spending=('order_total_value', 'sum')
+        ).reset_index()
+        cust_daily = cust_daily.sort_values(['customer_id', 'order_date'])
+        cust_daily['cum_orders'] = cust_daily.groupby('customer_id')['daily_count'].cumsum()
+        cust_daily['cum_spending'] = cust_daily.groupby('customer_id')['daily_spending'].cumsum()
+        cust_daily['cust_cum_orders_before'] = cust_daily.groupby('customer_id')['cum_orders'].shift(1).fillna(0)
+        cust_daily['cust_cum_spending_before'] = cust_daily.groupby('customer_id')['cum_spending'].shift(1).fillna(0)
+        cust_daily['prev_order_date'] = cust_daily.groupby('customer_id')['order_date'].shift(1)
+
+        # Tính cumulative returns của customer dựa trên ngày trả hàng thực tế
+        cust_returns = self.df_returns[['order_id', 'return_date']].dropna().merge(
+            all_orders[['order_id', 'customer_id']], on='order_id', how='inner'
+        )
+        cust_returns['return_date'] = pd.to_datetime(cust_returns['return_date'])
+        cust_returns_daily = cust_returns.groupby(['customer_id', 'return_date']).size().reset_index(name='daily_returns')
+        cust_returns_daily = cust_returns_daily.sort_values(['customer_id', 'return_date'])
+        cust_returns_daily['cum_returns'] = cust_returns_daily.groupby('customer_id')['daily_returns'].cumsum()
+
+        # Xây dựng bảng đặc trưng gốc cho X_base
+        df_base = X_base.copy()
+        df_base = df_base.merge(order_agg, on='order_id', how='left')
+        df_base = df_base.merge(dominant_cat, on='order_id', how='left')
+        df_base = df_base.merge(dominant_seg, on='order_id', how='left')
+        df_base = df_base.merge(self.df_geography[['zip', 'region']], on='zip', how='left')
+        
+        # Ghép thông tin customer tĩnh
+        df_base = df_base.merge(
+            self.df_customers[['customer_id', 'signup_date', 'gender', 'age_group', 'acquisition_channel']], 
+            on='customer_id', how='left'
+        )
+        df_base['customer_tenure_days'] = (df_base['order_date'] - df_base['signup_date']).dt.days.clip(lower=0)
+
+        # Ghép lịch sử đặt hàng của customer
+        df_base = df_base.merge(
+            cust_daily[['customer_id', 'order_date', 'cust_cum_orders_before', 'cust_cum_spending_before', 'prev_order_date']],
+            on=['customer_id', 'order_date'],
+            how='left'
+        )
+        df_base['customer_order_number'] = df_base['cust_cum_orders_before'] + 1
+        df_base['is_first_order'] = (df_base['customer_order_number'] == 1).astype(int)
+        df_base['customer_recency_days'] = (df_base['order_date'] - df_base['prev_order_date']).dt.days.fillna(-1)
+        df_base['customer_avg_order_value'] = (df_base['cust_cum_spending_before'] / df_base['cust_cum_orders_before'].clip(lower=1)).fillna(0)
+        df_base.drop(columns=['cust_cum_spending_before', 'prev_order_date'], errors='ignore', inplace=True)
+
+        # Ghép lịch sử trả hàng thực tế (merge_asof)
+        df_base = df_base.sort_values('order_date')
+        cust_returns_daily_sorted = cust_returns_daily[['customer_id', 'return_date', 'cum_returns']].sort_values('return_date')
+        df_base = pd.merge_asof(
+            df_base,
+            cust_returns_daily_sorted,
+            left_on='order_date',
+            right_on='return_date',
+            by='customer_id',
+            direction='backward',
+            allow_exact_matches=False
+        )
+        df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
+        df_base['customer_return_rate'] = (df_base['cum_returns'] / df_base['cust_cum_orders_before'].clip(lower=1)).fillna(0)
+        df_base['customer_return_count'] = df_base['cum_returns']
+        df_base['customer_total_orders_before'] = df_base['cust_cum_orders_before']
+        df_base.drop(columns=['return_date', 'cum_returns', 'cust_cum_orders_before'], errors='ignore', inplace=True)
+
+        # ── 4. Customer Review Features (Leakage-free) ────────────────────
+        cust_reviews = self.df_reviews[['customer_id', 'review_date', 'rating']].dropna().copy()
+        cust_reviews_daily = cust_reviews.groupby(['customer_id', 'review_date']).agg(
+            daily_count=('rating', 'count'),
+            daily_rating_sum=('rating', 'sum')
+        ).reset_index()
+        cust_reviews_daily = cust_reviews_daily.sort_values(['customer_id', 'review_date'])
+        cust_reviews_daily['cum_reviews'] = cust_reviews_daily.groupby('customer_id')['daily_count'].cumsum()
+        cust_reviews_daily['cum_rating_sum'] = cust_reviews_daily.groupby('customer_id')['daily_rating_sum'].cumsum()
+
+        df_base = df_base.sort_values('order_date')
+        cust_reviews_daily_sorted = cust_reviews_daily.sort_values('review_date')
+        df_base = pd.merge_asof(
+            df_base,
+            cust_reviews_daily_sorted[['customer_id', 'review_date', 'cum_reviews', 'cum_rating_sum']],
+            left_on='order_date',
+            right_on='review_date',
+            by='customer_id',
+            direction='backward',
+            allow_exact_matches=False
+        )
+        df_base['cum_reviews'] = df_base['cum_reviews'].fillna(0)
+        df_base['cum_rating_sum'] = df_base['cum_rating_sum'].fillna(0)
+        df_base['customer_avg_rating'] = (df_base['cum_rating_sum'] / df_base['cum_reviews'].clip(lower=1)).fillna(0)
+        df_base['customer_review_count'] = df_base['cum_reviews']
+        df_base['has_reviewed'] = (df_base['customer_review_count'] > 0).astype(int)
+        df_base.drop(columns=['review_date', 'cum_reviews', 'cum_rating_sum'], errors='ignore', inplace=True)
+
+        # ── 5. Target-encoded Features (Leakage-free) ─────────────────────
+        all_order_metadata = all_orders_agg[['order_id', 'order_date', 'dominant_category', 'region', 'payment_method']].copy()
+
+        # Category
+        cat_daily_orders = all_order_metadata.groupby(['dominant_category', 'order_date']).size().reset_index(name='daily_count')
+        cat_daily_orders = cat_daily_orders.sort_values(['dominant_category', 'order_date'])
+        cat_daily_orders['cum_orders'] = cat_daily_orders.groupby('dominant_category')['daily_count'].cumsum()
+        cat_daily_orders['cum_orders_before'] = cat_daily_orders.groupby('dominant_category')['cum_orders'].shift(1).fillna(0)
+
+        cat_returns = self.df_returns[['order_id', 'return_date']].dropna().merge(
+            all_order_metadata[['order_id', 'dominant_category']], on='order_id', how='inner'
+        )
+        cat_returns_daily = cat_returns.groupby(['dominant_category', 'return_date']).size().reset_index(name='daily_returns')
+        cat_returns_daily = cat_returns_daily.sort_values(['dominant_category', 'return_date'])
+        cat_returns_daily['cum_returns'] = cat_returns_daily.groupby('dominant_category')['daily_returns'].cumsum()
+
+        df_base = df_base.merge(cat_daily_orders[['dominant_category', 'order_date', 'cum_orders_before']], on=['dominant_category', 'order_date'], how='left')
+        df_base['cum_orders_before'] = df_base['cum_orders_before'].fillna(0)
+        
+        df_base = df_base.sort_values('order_date')
+        cat_returns_daily_sorted = cat_returns_daily[['dominant_category', 'return_date', 'cum_returns']].sort_values('return_date')
+        df_base = pd.merge_asof(
+            df_base,
+            cat_returns_daily_sorted,
+            left_on='order_date',
+            right_on='return_date',
+            by='dominant_category',
+            direction='backward',
+            allow_exact_matches=False
+        )
+        df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
+        df_base['category_hist_return_rate'] = (df_base['cum_returns'] / df_base['cum_orders_before'].clip(lower=1)).fillna(0)
+        df_base.drop(columns=['return_date', 'cum_returns', 'cum_orders_before'], errors='ignore', inplace=True)
+
+        # Region
+        reg_daily_orders = all_order_metadata.groupby(['region', 'order_date']).size().reset_index(name='daily_count')
+        reg_daily_orders = reg_daily_orders.sort_values(['region', 'order_date'])
+        reg_daily_orders['cum_orders'] = reg_daily_orders.groupby('region')['daily_count'].cumsum()
+        reg_daily_orders['cum_orders_before'] = reg_daily_orders.groupby('region')['cum_orders'].shift(1).fillna(0)
+
+        reg_returns = self.df_returns[['order_id', 'return_date']].dropna().merge(
+            all_order_metadata[['order_id', 'region']], on='order_id', how='inner'
+        )
+        reg_returns_daily = reg_returns.groupby(['region', 'return_date']).size().reset_index(name='daily_returns')
+        reg_returns_daily = reg_returns_daily.sort_values(['region', 'return_date'])
+        reg_returns_daily['cum_returns'] = reg_returns_daily.groupby('region')['daily_returns'].cumsum()
+
+        df_base = df_base.merge(reg_daily_orders[['region', 'order_date', 'cum_orders_before']], on=['region', 'order_date'], how='left')
+        df_base['cum_orders_before'] = df_base['cum_orders_before'].fillna(0)
+
+        df_base = df_base.sort_values('order_date')
+        reg_returns_daily_sorted = reg_returns_daily[['region', 'return_date', 'cum_returns']].sort_values('return_date')
+        df_base = pd.merge_asof(
+            df_base,
+            reg_returns_daily_sorted,
+            left_on='order_date',
+            right_on='return_date',
+            by='region',
+            direction='backward',
+            allow_exact_matches=False
+        )
+        df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
+        df_base['region_hist_return_rate'] = (df_base['cum_returns'] / df_base['cum_orders_before'].clip(lower=1)).fillna(0)
+        df_base.drop(columns=['return_date', 'cum_returns', 'cum_orders_before'], errors='ignore', inplace=True)
+
+        # Payment method
+        pay_daily_orders = all_order_metadata.groupby(['payment_method', 'order_date']).size().reset_index(name='daily_count')
+        pay_daily_orders = pay_daily_orders.sort_values(['payment_method', 'order_date'])
+        pay_daily_orders['cum_orders'] = pay_daily_orders.groupby('payment_method')['daily_count'].cumsum()
+        pay_daily_orders['cum_orders_before'] = pay_daily_orders.groupby('payment_method')['cum_orders'].shift(1).fillna(0)
+
+        pay_returns = self.df_returns[['order_id', 'return_date']].dropna().merge(
+            all_order_metadata[['order_id', 'payment_method']], on='order_id', how='inner'
+        )
+        pay_returns_daily = pay_returns.groupby(['payment_method', 'return_date']).size().reset_index(name='daily_returns')
+        pay_returns_daily = pay_returns_daily.sort_values(['payment_method', 'return_date'])
+        pay_returns_daily['cum_returns'] = pay_returns_daily.groupby('payment_method')['daily_returns'].cumsum()
+
+        df_base = df_base.merge(pay_daily_orders[['payment_method', 'order_date', 'cum_orders_before']], on=['payment_method', 'order_date'], how='left')
+        df_base['cum_orders_before'] = df_base['cum_orders_before'].fillna(0)
+
+        df_base = df_base.sort_values('order_date')
+        pay_returns_daily_sorted = pay_returns_daily[['payment_method', 'return_date', 'cum_returns']].sort_values('return_date')
+        df_base = pd.merge_asof(
+            df_base,
+            pay_returns_daily_sorted,
+            left_on='order_date',
+            right_on='return_date',
+            by='payment_method',
+            direction='backward',
+            allow_exact_matches=False
+        )
+        df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
+        df_base['payment_hist_return_rate'] = (df_base['cum_returns'] / df_base['cum_orders_before'].clip(lower=1)).fillna(0)
+        df_base.drop(columns=['return_date', 'cum_returns', 'cum_orders_before'], errors='ignore', inplace=True)
+
+        # ── 6. Other features & interactions ──────────────────────────────
         df_base = df_base.merge(order_prod_hist, on='order_id', how='left')
         for col in ['avg_prod_hist_return_rate', 'max_prod_hist_return_rate', 'sum_prod_hist_returns']:
             df_base[col] = df_base[col].fillna(0)
-        
-        # 4. Customer Features
-        df_base = df_base.merge(self.df_customers[['customer_id', 'signup_date', 'gender', 'age_group', 'acquisition_channel']], on='customer_id', how='left')
-        df_base['customer_tenure_days'] = (df_base['order_date'] - df_base['signup_date']).dt.days.clip(lower=0)
-        
-        df_base = df_base.sort_values(['customer_id', 'order_date']).reset_index(drop=True)
-        df_base['customer_order_number'] = df_base.groupby('customer_id').cumcount() + 1
-        df_base['is_first_order'] = (df_base['customer_order_number'] == 1).astype(int)
-        
-        # Lấy is_returned từ df_returns để phục vụ cho các feature target-encoding dạng leakage-safe
-        returned_orders = self.df_returns['order_id'].unique()
-        df_base['is_returned'] = df_base['order_id'].isin(returned_orders).astype(int)
 
-        # Customer historical return rate & count (Leakage-safe)
-        df_base['cust_cum_returns'] = df_base.groupby('customer_id')['is_returned'].cumsum()
-        df_base['cust_cum_returns'] = df_base.groupby('customer_id')['cust_cum_returns'].shift(1).fillna(0)
-        df_base['cust_cum_orders'] = df_base.groupby('customer_id').cumcount()
-
-        df_base['customer_return_rate'] = df_base['cust_cum_returns'] / df_base['cust_cum_orders'].clip(lower=1)
-        df_base['customer_return_count'] = df_base['cust_cum_returns']
-        df_base['customer_total_orders_before'] = df_base['cust_cum_orders']
-        df_base.drop(columns=['cust_cum_returns', 'cust_cum_orders'], inplace=True)
-
-        # Customer recency
-        df_base = df_base.sort_values(['customer_id', 'order_date'])
-        df_base['prev_order_date'] = df_base.groupby('customer_id')['order_date'].shift(1)
-        df_base['customer_recency_days'] = (df_base['order_date'] - df_base['prev_order_date']).dt.days
-        df_base['customer_recency_days'] = df_base['customer_recency_days'].fillna(-1)
-        df_base.drop(columns=['prev_order_date'], inplace=True)
-
-        # Customer average order value (historical)
-        df_base = df_base.sort_values(['customer_id', 'order_date'])
-        df_base['cust_cum_spending'] = df_base.groupby('customer_id')['order_total_value'].cumsum()
-        df_base['cust_cum_spending'] = df_base.groupby('customer_id')['cust_cum_spending'].shift(1).fillna(0)
-        df_base['cust_cum_cnt'] = df_base.groupby('customer_id').cumcount()
-        df_base['customer_avg_order_value'] = df_base['cust_cum_spending'] / df_base['cust_cum_cnt'].clip(lower=1)
-        df_base['customer_avg_order_value'] = df_base['customer_avg_order_value'].fillna(0)
-        df_base.drop(columns=['cust_cum_spending', 'cust_cum_cnt'], inplace=True)
-
-        # Channel features
-        df_base = df_base.merge(self.df_geography[['zip', 'region']], on='zip', how='left')
         df_base['is_cod'] = (df_base['payment_method'] == 'cod').astype(int)
 
-        # Temporal features
         df_base['order_month'] = df_base['order_date'].dt.month
         df_base['order_day_of_week'] = df_base['order_date'].dt.dayofweek
         df_base['order_day_of_year'] = df_base['order_date'].dt.dayofyear
@@ -166,50 +368,6 @@ class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
         df_base['dow_sin'] = np.sin(2 * np.pi * df_base['order_day_of_week'] / 7)
         df_base['dow_cos'] = np.cos(2 * np.pi * df_base['order_day_of_week'] / 7)
 
-        # Customer review features (Leakage-safe)
-        reviews_with_date = self.df_reviews.merge(
-            df_base[['order_id', 'order_date', 'customer_id']],
-            on=['order_id', 'customer_id'], how='inner'
-        )
-        reviews_with_date = reviews_with_date.sort_values(['customer_id', 'order_date'])
-
-        reviews_with_date['cum_rating_sum'] = reviews_with_date.groupby('customer_id')['rating'].cumsum()
-        reviews_with_date['cum_rating_sum'] = reviews_with_date.groupby('customer_id')['cum_rating_sum'].shift(1).fillna(0)
-        reviews_with_date['cum_review_cnt'] = reviews_with_date.groupby('customer_id').cumcount()
-        reviews_with_date['hist_avg_rating'] = reviews_with_date['cum_rating_sum'] / reviews_with_date['cum_review_cnt'].clip(lower=1)
-
-        cust_review_hist = reviews_with_date.groupby(['order_id', 'customer_id']).agg(
-            customer_avg_rating=('hist_avg_rating', 'first'),
-            customer_review_count=('cum_review_cnt', 'first'),
-        ).reset_index()
-
-        df_base = df_base.merge(cust_review_hist, on=['order_id', 'customer_id'], how='left')
-        df_base['customer_avg_rating'] = df_base['customer_avg_rating'].fillna(0)
-        df_base['customer_review_count'] = df_base['customer_review_count'].fillna(0)
-        df_base['has_reviewed'] = (df_base['customer_review_count'] > 0).astype(int)
-
-        # Target-encoded features (Leakage-safe expanding mean)
-        df_base = df_base.sort_values('order_date').reset_index(drop=True)
-
-        df_base['cat_cum_returns'] = df_base.groupby('dominant_category')['is_returned'].cumsum()
-        df_base['cat_cum_returns'] = df_base.groupby('dominant_category')['cat_cum_returns'].shift(1).fillna(0)
-        df_base['cat_cum_total'] = df_base.groupby('dominant_category').cumcount()
-        df_base['category_hist_return_rate'] = df_base['cat_cum_returns'] / df_base['cat_cum_total'].clip(lower=1)
-        df_base.drop(columns=['cat_cum_returns', 'cat_cum_total'], inplace=True)
-
-        df_base['reg_cum_returns'] = df_base.groupby('region')['is_returned'].cumsum()
-        df_base['reg_cum_returns'] = df_base.groupby('region')['reg_cum_returns'].shift(1).fillna(0)
-        df_base['reg_cum_total'] = df_base.groupby('region').cumcount()
-        df_base['region_hist_return_rate'] = df_base['reg_cum_returns'] / df_base['reg_cum_total'].clip(lower=1)
-        df_base.drop(columns=['reg_cum_returns', 'reg_cum_total'], inplace=True)
-
-        df_base['pay_cum_returns'] = df_base.groupby('payment_method')['is_returned'].cumsum()
-        df_base['pay_cum_returns'] = df_base.groupby('payment_method')['pay_cum_returns'].shift(1).fillna(0)
-        df_base['pay_cum_total'] = df_base.groupby('payment_method').cumcount()
-        df_base['payment_hist_return_rate'] = df_base['pay_cum_returns'] / df_base['pay_cum_total'].clip(lower=1)
-        df_base.drop(columns=['pay_cum_returns', 'pay_cum_total'], inplace=True)
-
-        # Nonlinear interaction features
         df_base['items_per_product'] = df_base['n_items'] / df_base['n_products'].clip(lower=1)
         df_base['discount_ratio'] = df_base['total_discount'] / (df_base['order_total_value'] + df_base['total_discount']).clip(lower=1)
         df_base['size_variety_ratio'] = df_base['n_sizes'] / df_base['n_products'].clip(lower=1)
@@ -217,7 +375,6 @@ class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
         df_base['avg_value_per_item'] = df_base['order_total_value'] / df_base['n_items'].clip(lower=1)
         df_base['customer_return_tendency'] = df_base['customer_return_rate'] * df_base['customer_order_number']
 
-        # Trả về bộ Dataframe đã FE (chỉ lấy các cột feature mong muốn)
         numeric_features = [
             'n_products', 'n_items', 'n_categories', 'n_segments', 'n_sizes', 'n_colors',
             'order_total_value', 'avg_unit_price', 'std_unit_price',
@@ -241,12 +398,28 @@ class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
             'acquisition_channel', 'region', 'dominant_category', 'dominant_segment'
         ]
         
-        return df_base[numeric_features + categorical_features]
+        return df_base[['order_id', 'order_date'] + numeric_features + categorical_features]
 
 
-def build_pipeline(df_order_items, df_returns, df_products, df_customers, df_reviews, df_geography, scale_pos_weight):
+def build_pipeline(df_order_items, df_returns, df_products, df_customers, df_reviews, df_geography, scale_pos_weight, early_stopping_rounds=50):
     """
-    Hàm xây dựng Full Sklearn Pipeline
+    Hàm xây dựng Full Sklearn Pipeline.
+    
+    Lưu ý: Khi sử dụng early_stopping, KHÔNG gọi pipeline.fit() trực tiếp.
+    Thay vào đó, dùng các bước thủ công:
+        fe = pipeline.named_steps['fe']
+        preprocessor = pipeline.named_steps['preprocessor']
+        classifier = pipeline.named_steps['classifier']
+        
+        X_train_fe = fe.fit_transform(df_train)
+        X_train_pp = preprocessor.fit_transform(X_train_fe)
+        
+        X_val_fe = fe.transform(df_val)
+        X_val_pp = preprocessor.transform(X_val_fe)
+        
+        classifier.fit(X_train_pp, y_train,
+                        eval_set=[(X_train_pp, y_train), (X_val_pp, y_val)],
+                        verbose=100)
     """
     # 1. Pipeline Feature Engineering
     fe_transformer = ReturnFeatureExtractor(
@@ -294,7 +467,7 @@ def build_pipeline(df_order_items, df_returns, df_products, df_customers, df_rev
         remainder='drop'
     )
     
-    # 3. Model XGBoost (Tuned params)
+    # 3. Model XGBoost (Tuned params + Early Stopping)
     xgb_model = xgb.XGBClassifier(
         n_estimators=1000, 
         learning_rate=0.0174, 
@@ -304,6 +477,7 @@ def build_pipeline(df_order_items, df_returns, df_products, df_customers, df_rev
         colsample_bytree=0.608,
         scale_pos_weight=scale_pos_weight, 
         eval_metric='auc',
+        early_stopping_rounds=early_stopping_rounds,
         random_state=42, 
         n_jobs=-1,
         verbosity=0
