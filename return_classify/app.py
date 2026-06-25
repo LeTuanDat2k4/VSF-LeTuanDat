@@ -23,23 +23,51 @@ MODEL = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model from MLflow on startup."""
+    """Load model on startup and configure Redis Feature Store."""
     global MODEL
-    print("🔄 Loading model from MLflow...")
-    experiment = mlflow.get_experiment_by_name("Return_Classification")
-    if experiment is None:
-        raise RuntimeError("MLflow experiment 'Return_Classification' not found!")
-    runs = mlflow.search_runs(
-        experiment_ids=[experiment.experiment_id],
-        order_by=["attributes.start_time DESC"],
-        max_results=1,
-    )
-    if len(runs) == 0:
-        raise RuntimeError("No runs found in MLflow experiment!")
-    run_id = runs.iloc[0]["run_id"]
-    model_uri = f"runs:/{run_id}/model"
-    MODEL = mlflow.sklearn.load_model(model_uri)
-    print(f"✅ Model loaded from run {run_id}")
+    import os
+    
+    model_path = os.getenv("MODEL_PATH")
+    if model_path and os.path.exists(model_path):
+        print(f"🔄 Loading model from local path: {model_path}...")
+        MODEL = mlflow.sklearn.load_model(model_path)
+        print("✅ Model loaded successfully from local path!")
+    else:
+        print("🔄 Configuring MLflow tracking URI...")
+        db_path = os.path.abspath("mlflow.db").replace("\\", "/")
+        mlflow.set_tracking_uri(f"sqlite:///{db_path}")
+
+        print("🔄 Loading model from MLflow...")
+        experiment = mlflow.get_experiment_by_name("Return_Classification")
+        if experiment is None:
+            raise RuntimeError("MLflow experiment 'Return_Classification' not found!")
+        runs = mlflow.search_runs(
+            experiment_ids=[experiment.experiment_id],
+            order_by=["attributes.start_time DESC"],
+            max_results=1,
+        )
+        if len(runs) == 0:
+            raise RuntimeError("No runs found in MLflow experiment!")
+        run_id = runs.iloc[0]["run_id"]
+        model_uri = f"runs:/{run_id}/model"
+        MODEL = mlflow.sklearn.load_model(model_uri)
+        print(f"✅ Model loaded from run {run_id}")
+    
+    # Kích hoạt Redis Feature Store trực tuyến
+    print("🔌 Enabling Redis Feature Store...")
+    try:
+        fe_step = MODEL.named_steps['fe']
+        redis_url = os.getenv("REDIS_URL", "redis://default:UxHxBHpIF4iA2wffTzU20h50bbaiFrAv@suit-jeans-desire-88328.db.redis.io:12526")
+        fe_step.redis_url = redis_url
+        fe_step.use_redis_ = True
+        # Test connection
+        r = fe_step._get_redis_client()
+        if r.ping():
+            print("✅ Redis Feature Store connected and enabled successfully!")
+    except Exception as e:
+        print(f"❌ Failed to enable Redis Feature Store: {e}")
+        raise e
+        
     yield
     # Cleanup (nothing needed)
     print("👋 Shutting down...")

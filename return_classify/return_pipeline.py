@@ -14,7 +14,7 @@ class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
     Đã tối ưu hóa hiệu năng bằng cách precompute các bảng lũy kế lịch sử trong fit(),
     giúp transform() chạy cực nhanh (mili-giây) khi inference trực tuyến.
     """
-    def __init__(self, df_order_items, df_returns, df_products, df_customers, df_reviews, df_geography):
+    def __init__(self, df_order_items, df_returns, df_products, df_customers, df_reviews, df_geography, redis_url=None):
         # Nhận các bảng phụ làm tham số khởi tạo
         self.df_order_items = df_order_items.copy()
         self.df_returns = df_returns.copy()
@@ -23,6 +23,8 @@ class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
         self.df_reviews = df_reviews.copy()
         self.df_geography = df_geography.copy()
         self.train_orders = None
+        self.redis_url = redis_url
+        self.use_redis_ = False
 
         # Parse dates
         self.df_returns['return_date'] = pd.to_datetime(self.df_returns['return_date'])
@@ -157,6 +159,148 @@ class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
         
         return self
 
+    def _get_redis_client(self, redis_url=None):
+        url = redis_url or self.redis_url
+        if not url:
+            raise ValueError("redis_url is not set!")
+        if not hasattr(self, '_redis_client') or self._redis_client is None:
+            import redis
+            self._redis_client = redis.from_url(url, decode_responses=True)
+        return self._redis_client
+
+    def upload_to_redis(self, redis_url=None):
+        """
+        Đẩy toàn bộ trạng thái lũy kế lịch sử (historical cumulative features) 
+        của sản phẩm, khách hàng, danh mục, vùng miền và phương thức thanh toán lên Redis Cloud.
+        """
+        import json
+        r = self._get_redis_client(redis_url)
+        pipe = r.pipeline(transaction=False)
+        
+        print("🚀 Đang tính toán dữ liệu tích lũy và đẩy lên Redis Cloud...")
+        
+        count = 0
+        batch_size = 1000
+
+        # Helper to safely add to pipeline and execute if batch limit reached
+        def add_to_pipe(key, val):
+            nonlocal count
+            pipe.set(key, val)
+            count += 1
+            if count % batch_size == 0:
+                pipe.execute()
+                print(f"  → Đã đồng bộ {count} keys...")
+
+        # 1. Products
+        all_prod_orders = self.df_order_items[['order_id', 'product_id']].merge(
+            self.train_orders[['order_id']], on='order_id', how='inner'
+        )
+        prod_orders = all_prod_orders.groupby('product_id').size().to_dict()
+        prod_returns = self.df_returns.groupby('product_id').size().to_dict()
+        
+        for pid in self.df_products['product_id'].unique():
+            cum_orders = int(prod_orders.get(pid, 0))
+            cum_returns = int(prod_returns.get(pid, 0))
+            data = {"cum_orders": cum_orders, "cum_returns": cum_returns}
+            add_to_pipe(f"prod:feat:{pid}", json.dumps(data))
+
+        # 2. Customers
+        df_items_all = self.df_order_items.merge(self.df_products, on='product_id', how='left')
+        df_items_all = df_items_all[df_items_all['order_id'].isin(self.train_orders['order_id'])].copy()
+        df_items_all['line_total'] = df_items_all['quantity'] * df_items_all['unit_price'] - df_items_all['discount_amount']
+        order_agg_fit = df_items_all.groupby('order_id')['line_total'].sum().reset_index(name='order_total_value')
+        
+        all_orders_agg = self.train_orders.merge(order_agg_fit, on='order_id', how='left')
+        all_orders_agg['order_total_value'] = all_orders_agg['order_total_value'].fillna(0)
+        
+        cust_stats = all_orders_agg.groupby('customer_id').agg(
+            cum_orders=('order_id', 'count'),
+            cum_spending=('order_total_value', 'sum'),
+            last_order_date=('order_date', 'max')
+        )
+        cust_returns = self.df_returns[['order_id', 'return_date']].dropna().merge(
+            self.train_orders[['order_id', 'customer_id']], on='order_id', how='inner'
+        )
+        cust_returns_cnt = cust_returns.groupby('customer_id').size().to_dict()
+        
+        cust_reviews = self.df_reviews[['customer_id', 'rating']].dropna()
+        cust_reviews_stats = cust_reviews.groupby('customer_id').agg(
+            cum_reviews=('rating', 'count'),
+            cum_rating_sum=('rating', 'sum')
+        )
+        
+        for cid in self.df_customers['customer_id'].unique():
+            cum_orders = int(cust_stats.loc[cid, 'cum_orders']) if cid in cust_stats.index else 0
+            cum_spending = float(cust_stats.loc[cid, 'cum_spending']) if cid in cust_stats.index else 0.0
+            last_order_date = str(cust_stats.loc[cid, 'last_order_date'].date()) if (cid in cust_stats.index and pd.notna(cust_stats.loc[cid, 'last_order_date'])) else None
+            cum_returns = int(cust_returns_cnt.get(cid, 0))
+            cum_reviews = int(cust_reviews_stats.loc[cid, 'cum_reviews']) if cid in cust_reviews_stats.index else 0
+            cum_rating_sum = float(cust_reviews_stats.loc[cid, 'cum_rating_sum']) if cid in cust_reviews_stats.index else 0.0
+            
+            data = {
+                "cum_orders": cum_orders,
+                "cum_spending": cum_spending,
+                "last_order_date": last_order_date,
+                "cum_returns": cum_returns,
+                "cum_reviews": cum_reviews,
+                "cum_rating_sum": cum_rating_sum
+            }
+            add_to_pipe(f"cust:feat:{cid}", json.dumps(data))
+
+        # 3. Target-encoded (Category, Region, Payment)
+        dominant_cat_fit = df_items_all.groupby('order_id')['category'].agg(lambda x: x.mode().iloc[0] if len(x) > 0 else 'unknown').reset_index(name='dominant_category')
+        all_orders_geo = self.train_orders.merge(self.df_geography[['zip', 'region']], on='zip', how='left')
+        all_orders_geo = all_orders_geo.merge(dominant_cat_fit, on='order_id', how='left')
+        all_order_metadata = all_orders_geo[['order_id', 'order_date', 'dominant_category', 'region', 'payment_method']].copy()
+        
+        # Category
+        cat_orders = all_order_metadata.groupby('dominant_category').size().to_dict()
+        cat_returns_df = self.df_returns[['order_id']].merge(
+            all_order_metadata[['order_id', 'dominant_category']], on='order_id', how='inner'
+        )
+        cat_returns = cat_returns_df.groupby('dominant_category').size().to_dict()
+        
+        unique_cats = all_order_metadata['dominant_category'].dropna().unique()
+        for cat in unique_cats:
+            cum_orders = int(cat_orders.get(cat, 0))
+            cum_returns = int(cat_returns.get(cat, 0))
+            data = {"cum_orders": cum_orders, "cum_returns": cum_returns}
+            add_to_pipe(f"cat:feat:{cat}", json.dumps(data))
+            
+        # Region
+        reg_orders = all_order_metadata.groupby('region').size().to_dict()
+        reg_returns_df = self.df_returns[['order_id']].merge(
+            all_order_metadata[['order_id', 'region']], on='order_id', how='inner'
+        )
+        reg_returns = reg_returns_df.groupby('region').size().to_dict()
+        
+        unique_regs = all_order_metadata['region'].dropna().unique()
+        for reg in unique_regs:
+            cum_orders = int(reg_orders.get(reg, 0))
+            cum_returns = int(reg_returns.get(reg, 0))
+            data = {"cum_orders": cum_orders, "cum_returns": cum_returns}
+            add_to_pipe(f"reg:feat:{reg}", json.dumps(data))
+            
+        # Payment
+        pay_orders = all_order_metadata.groupby('payment_method').size().to_dict()
+        pay_returns_df = self.df_returns[['order_id']].merge(
+            all_order_metadata[['order_id', 'payment_method']], on='order_id', how='inner'
+        )
+        pay_returns = pay_returns_df.groupby('payment_method').size().to_dict()
+        
+        unique_pays = all_order_metadata['payment_method'].dropna().unique()
+        for pay in unique_pays:
+            cum_orders = int(pay_orders.get(pay, 0))
+            cum_returns = int(pay_returns.get(pay, 0))
+            data = {"cum_orders": cum_orders, "cum_returns": cum_returns}
+            add_to_pipe(f"pay:feat:{pay}", json.dumps(data))
+
+        # Final execute for remaining
+        if count % batch_size != 0:
+            pipe.execute()
+        
+        print(f"✅ Đã hoàn tất đẩy tất cả {count} đặc trưng lên Redis Cloud!")
+
     def transform(self, X):
         """
         X: df_orders (bảng đơn hàng cần dự đoán)
@@ -242,26 +386,43 @@ class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
         X_items['order_date'] = pd.to_datetime(X_items['order_date'])
         
         if len(X_items) > 0:
-            X_items = X_items.merge(
-                self.prod_daily_orders_,
-                on=['product_id', 'order_date'],
-                how='left'
-            )
-            X_items['cum_orders_before'] = X_items['cum_orders_before'].fillna(0)
-            
-            X_items = X_items.sort_values('order_date')
-            prod_returns_sorted = self.prod_returns_daily_sorted_.sort_values('return_date')
-            X_items = pd.merge_asof(
-                X_items,
-                prod_returns_sorted,
-                left_on='order_date',
-                right_on='return_date',
-                by='product_id',
-                direction='backward',
-                allow_exact_matches=False
-            )
-            X_items['cum_returns'] = X_items['cum_returns'].fillna(0)
-            X_items['prod_hist_return_rate'] = X_items['cum_returns'] / X_items['cum_orders_before'].clip(lower=1)
+            if getattr(self, 'use_redis_', False):
+                r = self._get_redis_client()
+                unique_prod_ids = X_items['product_id'].unique()
+                prod_keys = [f"prod:feat:{pid}" for pid in unique_prod_ids]
+                prod_data = {}
+                if prod_keys:
+                    vals = r.mget(prod_keys)
+                    import json
+                    for pid, val in zip(unique_prod_ids, vals):
+                        if val:
+                            prod_data[pid] = json.loads(val)
+                        else:
+                            prod_data[pid] = {"cum_orders": 0, "cum_returns": 0}
+                X_items['cum_orders_before'] = X_items['product_id'].map(lambda x: prod_data.get(x, {}).get('cum_orders', 0)).fillna(0)
+                X_items['cum_returns'] = X_items['product_id'].map(lambda x: prod_data.get(x, {}).get('cum_returns', 0)).fillna(0)
+                X_items['prod_hist_return_rate'] = X_items['cum_returns'] / X_items['cum_orders_before'].clip(lower=1)
+            else:
+                X_items = X_items.merge(
+                    self.prod_daily_orders_,
+                    on=['product_id', 'order_date'],
+                    how='left'
+                )
+                X_items['cum_orders_before'] = X_items['cum_orders_before'].fillna(0)
+                
+                X_items = X_items.sort_values('order_date')
+                prod_returns_sorted = self.prod_returns_daily_sorted_.sort_values('return_date')
+                X_items = pd.merge_asof(
+                    X_items,
+                    prod_returns_sorted,
+                    left_on='order_date',
+                    right_on='return_date',
+                    by='product_id',
+                    direction='backward',
+                    allow_exact_matches=False
+                )
+                X_items['cum_returns'] = X_items['cum_returns'].fillna(0)
+                X_items['prod_hist_return_rate'] = X_items['cum_returns'] / X_items['cum_orders_before'].clip(lower=1)
             
             order_prod_hist = X_items.groupby('order_id').agg(
                 avg_prod_hist_return_rate=('prod_hist_return_rate', 'mean'),
@@ -271,128 +432,226 @@ class ReturnFeatureExtractor(BaseEstimator, TransformerMixin):
         else:
             order_prod_hist = pd.DataFrame(columns=['order_id', 'avg_prod_hist_return_rate', 'max_prod_hist_return_rate', 'sum_prod_hist_returns'])
 
-        # ── 3. Customer Features ──────────────────────────────────────────
-        df_base = df_base.merge(
-            self.df_customers[['customer_id', 'signup_date', 'gender', 'age_group', 'acquisition_channel']], 
-            on='customer_id', how='left'
-        )
-        df_base['customer_tenure_days'] = (df_base['order_date'] - df_base['signup_date']).dt.days.clip(lower=0).fillna(0)
-        
-        df_base = df_base.sort_values('order_date')
-        df_base = df_base.merge(
-            self.cust_daily_,
-            on=['customer_id', 'order_date'],
-            how='left'
-        )
-        df_base['cust_cum_orders_before'] = df_base['cust_cum_orders_before'].fillna(0)
-        df_base['cust_cum_spending_before'] = df_base['cust_cum_spending_before'].fillna(0)
-        
-        df_base['customer_order_number'] = df_base['cust_cum_orders_before'] + 1
-        df_base['is_first_order'] = (df_base['customer_order_number'] == 1).astype(int)
-        df_base['customer_recency_days'] = (df_base['order_date'] - df_base['prev_order_date']).dt.days.fillna(-1)
-        df_base['customer_avg_order_value'] = (df_base['cust_cum_spending_before'] / df_base['cust_cum_orders_before'].clip(lower=1)).fillna(0)
-        df_base.drop(columns=['cust_cum_spending_before', 'prev_order_date'], errors='ignore', inplace=True)
-        
-        cust_returns_sorted = self.cust_returns_daily_sorted_.sort_values('return_date')
-        df_base = pd.merge_asof(
-            df_base,
-            cust_returns_sorted,
-            left_on='order_date',
-            right_on='return_date',
-            by='customer_id',
-            direction='backward',
-            allow_exact_matches=False
-        )
-        df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
-        df_base['customer_return_rate'] = (df_base['cum_returns'] / df_base['cust_cum_orders_before'].clip(lower=1)).fillna(0)
-        df_base['customer_return_count'] = df_base['cum_returns']
-        df_base['customer_total_orders_before'] = df_base['cust_cum_orders_before']
-        df_base.drop(columns=['return_date', 'cum_returns', 'cust_cum_orders_before'], errors='ignore', inplace=True)
+        if getattr(self, 'use_redis_', False):
+            r = self._get_redis_client()
+            import json
+            
+            # ── 3. Customer Features (Redis) ──────────────────────────────────
+            unique_cust_ids = df_base['customer_id'].unique()
+            cust_keys = [f"cust:feat:{cid}" for cid in unique_cust_ids]
+            cust_data = {}
+            if cust_keys:
+                vals = r.mget(cust_keys)
+                for cid, val in zip(unique_cust_ids, vals):
+                    if val:
+                        cust_data[cid] = json.loads(val)
+                    else:
+                        cust_data[cid] = {
+                            "cum_orders": 0,
+                            "cum_spending": 0.0,
+                            "last_order_date": None,
+                            "cum_returns": 0,
+                            "cum_reviews": 0,
+                            "cum_rating_sum": 0.0
+                        }
+            
+            df_base = df_base.merge(
+                self.df_customers[['customer_id', 'signup_date', 'gender', 'age_group', 'acquisition_channel']], 
+                on='customer_id', how='left'
+            )
+            df_base['customer_tenure_days'] = (df_base['order_date'] - df_base['signup_date']).dt.days.clip(lower=0).fillna(0)
+            
+            cust_cum_orders_before = df_base['customer_id'].map(lambda x: cust_data.get(x, {}).get('cum_orders', 0)).fillna(0)
+            cust_cum_spending_before = df_base['customer_id'].map(lambda x: cust_data.get(x, {}).get('cum_spending', 0.0)).fillna(0.0)
+            last_order_dates = pd.to_datetime(df_base['customer_id'].map(lambda x: cust_data.get(x, {}).get('last_order_date', None)))
+            
+            df_base['customer_order_number'] = cust_cum_orders_before + 1
+            df_base['is_first_order'] = (df_base['customer_order_number'] == 1).astype(int)
+            
+            df_base['customer_recency_days'] = (df_base['order_date'] - last_order_dates).dt.days.fillna(-1)
+            df_base['customer_avg_order_value'] = (cust_cum_spending_before / cust_cum_orders_before.clip(lower=1)).fillna(0)
+            
+            customer_return_count = df_base['customer_id'].map(lambda x: cust_data.get(x, {}).get('cum_returns', 0)).fillna(0)
+            df_base['customer_return_rate'] = (customer_return_count / cust_cum_orders_before.clip(lower=1)).fillna(0)
+            df_base['customer_return_count'] = customer_return_count
+            df_base['customer_total_orders_before'] = cust_cum_orders_before
+            
+            # ── 4. Customer Review Features (Redis) ───────────────────────────
+            customer_review_count = df_base['customer_id'].map(lambda x: cust_data.get(x, {}).get('cum_reviews', 0)).fillna(0)
+            cum_rating_sum = df_base['customer_id'].map(lambda x: cust_data.get(x, {}).get('cum_rating_sum', 0.0)).fillna(0.0)
+            
+            df_base['customer_avg_rating'] = (cum_rating_sum / customer_review_count.clip(lower=1)).fillna(0)
+            df_base['customer_review_count'] = customer_review_count
+            df_base['has_reviewed'] = (customer_review_count > 0).astype(int)
+            
+            # ── 5. Target-encoded Features (Redis) ────────────────────────────
+            # Category
+            unique_cats = df_base['dominant_category'].unique()
+            cat_keys = [f"cat:feat:{cat}" for cat in unique_cats]
+            cat_data = {}
+            if cat_keys:
+                vals = r.mget(cat_keys)
+                for cat, val in zip(unique_cats, vals):
+                    if val:
+                        cat_data[cat] = json.loads(val)
+                    else:
+                        cat_data[cat] = {"cum_orders": 0, "cum_returns": 0}
+            cat_orders = df_base['dominant_category'].map(lambda x: cat_data.get(x, {}).get('cum_orders', 0)).fillna(0)
+            cat_returns = df_base['dominant_category'].map(lambda x: cat_data.get(x, {}).get('cum_returns', 0)).fillna(0)
+            df_base['category_hist_return_rate'] = (cat_returns / cat_orders.clip(lower=1)).fillna(0)
+            
+            # Region
+            unique_regs = df_base['region'].unique()
+            reg_keys = [f"reg:feat:{reg}" for reg in unique_regs]
+            reg_data = {}
+            if reg_keys:
+                vals = r.mget(reg_keys)
+                for reg, val in zip(unique_regs, vals):
+                    if val:
+                        reg_data[reg] = json.loads(val)
+                    else:
+                        reg_data[reg] = {"cum_orders": 0, "cum_returns": 0}
+            reg_orders = df_base['region'].map(lambda x: reg_data.get(x, {}).get('cum_orders', 0)).fillna(0)
+            reg_returns = df_base['region'].map(lambda x: reg_data.get(x, {}).get('cum_returns', 0)).fillna(0)
+            df_base['region_hist_return_rate'] = (reg_returns / reg_orders.clip(lower=1)).fillna(0)
+            
+            # Payment Method
+            unique_pays = df_base['payment_method'].unique()
+            pay_keys = [f"pay:feat:{pay}" for pay in unique_pays]
+            pay_data = {}
+            if pay_keys:
+                vals = r.mget(pay_keys)
+                for pay, val in zip(unique_pays, vals):
+                    if val:
+                        pay_data[pay] = json.loads(val)
+                    else:
+                        pay_data[pay] = {"cum_orders": 0, "cum_returns": 0}
+            pay_orders = df_base['payment_method'].map(lambda x: pay_data.get(x, {}).get('cum_orders', 0)).fillna(0)
+            pay_returns = df_base['payment_method'].map(lambda x: pay_data.get(x, {}).get('cum_returns', 0)).fillna(0)
+            df_base['payment_hist_return_rate'] = (pay_returns / pay_orders.clip(lower=1)).fillna(0)
+        else:
+            # ── 3. Customer Features ──────────────────────────────────────────
+            df_base = df_base.merge(
+                self.df_customers[['customer_id', 'signup_date', 'gender', 'age_group', 'acquisition_channel']], 
+                on='customer_id', how='left'
+            )
+            df_base['customer_tenure_days'] = (df_base['order_date'] - df_base['signup_date']).dt.days.clip(lower=0).fillna(0)
+            
+            df_base = df_base.sort_values('order_date')
+            df_base = df_base.merge(
+                self.cust_daily_,
+                on=['customer_id', 'order_date'],
+                how='left'
+            )
+            df_base['cust_cum_orders_before'] = df_base['cust_cum_orders_before'].fillna(0)
+            df_base['cust_cum_spending_before'] = df_base['cust_cum_spending_before'].fillna(0)
+            
+            df_base['customer_order_number'] = df_base['cust_cum_orders_before'] + 1
+            df_base['is_first_order'] = (df_base['customer_order_number'] == 1).astype(int)
+            df_base['customer_recency_days'] = (df_base['order_date'] - df_base['prev_order_date']).dt.days.fillna(-1)
+            df_base['customer_avg_order_value'] = (df_base['cust_cum_spending_before'] / df_base['cust_cum_orders_before'].clip(lower=1)).fillna(0)
+            df_base.drop(columns=['cust_cum_spending_before', 'prev_order_date'], errors='ignore', inplace=True)
+            
+            cust_returns_sorted = self.cust_returns_daily_sorted_.sort_values('return_date')
+            df_base = pd.merge_asof(
+                df_base,
+                cust_returns_sorted,
+                left_on='order_date',
+                right_on='return_date',
+                by='customer_id',
+                direction='backward',
+                allow_exact_matches=False
+            )
+            df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
+            df_base['customer_return_rate'] = (df_base['cum_returns'] / df_base['cust_cum_orders_before'].clip(lower=1)).fillna(0)
+            df_base['customer_return_count'] = df_base['cum_returns']
+            df_base['customer_total_orders_before'] = df_base['cust_cum_orders_before']
+            df_base.drop(columns=['return_date', 'cum_returns', 'cust_cum_orders_before'], errors='ignore', inplace=True)
 
-        # ── 4. Customer Review Features ───────────────────────────────────
-        cust_reviews_sorted = self.cust_reviews_daily_sorted_.sort_values('review_date')
-        df_base = pd.merge_asof(
-            df_base,
-            cust_reviews_sorted,
-            left_on='order_date',
-            right_on='review_date',
-            by='customer_id',
-            direction='backward',
-            allow_exact_matches=False
-        )
-        df_base['cum_reviews'] = df_base['cum_reviews'].fillna(0)
-        df_base['cum_rating_sum'] = df_base['cum_rating_sum'].fillna(0)
-        df_base['customer_avg_rating'] = (df_base['cum_rating_sum'] / df_base['cum_reviews'].clip(lower=1)).fillna(0)
-        df_base['customer_review_count'] = df_base['cum_reviews']
-        df_base['has_reviewed'] = (df_base['customer_review_count'] > 0).astype(int)
-        df_base.drop(columns=['review_date', 'cum_reviews', 'cum_rating_sum'], errors='ignore', inplace=True)
+            # ── 4. Customer Review Features ───────────────────────────────────
+            cust_reviews_sorted = self.cust_reviews_daily_sorted_.sort_values('review_date')
+            df_base = pd.merge_asof(
+                df_base,
+                cust_reviews_sorted,
+                left_on='order_date',
+                right_on='review_date',
+                by='customer_id',
+                direction='backward',
+                allow_exact_matches=False
+            )
+            df_base['cum_reviews'] = df_base['cum_reviews'].fillna(0)
+            df_base['cum_rating_sum'] = df_base['cum_rating_sum'].fillna(0)
+            df_base['customer_avg_rating'] = (df_base['cum_rating_sum'] / df_base['cum_reviews'].clip(lower=1)).fillna(0)
+            df_base['customer_review_count'] = df_base['cum_reviews']
+            df_base['has_reviewed'] = (df_base['customer_review_count'] > 0).astype(int)
+            df_base.drop(columns=['review_date', 'cum_reviews', 'cum_rating_sum'], errors='ignore', inplace=True)
 
-        # ── 5. Target-encoded Features ────────────────────────────────────
-        # Category
-        df_base = df_base.merge(
-            self.cat_daily_orders_,
-            on=['dominant_category', 'order_date'],
-            how='left'
-        )
-        df_base['cum_orders_before'] = df_base['cum_orders_before'].fillna(0)
-        
-        cat_returns_sorted = self.cat_returns_daily_sorted_.sort_values('return_date')
-        df_base = pd.merge_asof(
-            df_base,
-            cat_returns_sorted,
-            left_on='order_date',
-            right_on='return_date',
-            by='dominant_category',
-            direction='backward',
-            allow_exact_matches=False
-        )
-        df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
-        df_base['category_hist_return_rate'] = (df_base['cum_returns'] / df_base['cum_orders_before'].clip(lower=1)).fillna(0)
-        df_base.drop(columns=['return_date', 'cum_returns', 'cum_orders_before'], errors='ignore', inplace=True)
-        
-        # Region
-        df_base = df_base.merge(
-            self.reg_daily_orders_,
-            on=['region', 'order_date'],
-            how='left'
-        )
-        df_base['cum_orders_before'] = df_base['cum_orders_before'].fillna(0)
-        
-        reg_returns_sorted = self.reg_returns_daily_sorted_.sort_values('return_date')
-        df_base = pd.merge_asof(
-            df_base,
-            reg_returns_sorted,
-            left_on='order_date',
-            right_on='return_date',
-            by='region',
-            direction='backward',
-            allow_exact_matches=False
-        )
-        df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
-        df_base['region_hist_return_rate'] = (df_base['cum_returns'] / df_base['cum_orders_before'].clip(lower=1)).fillna(0)
-        df_base.drop(columns=['return_date', 'cum_returns', 'cum_orders_before'], errors='ignore', inplace=True)
-        
-        # Payment Method
-        df_base = df_base.merge(
-            self.pay_daily_orders_,
-            on=['payment_method', 'order_date'],
-            how='left'
-        )
-        df_base['cum_orders_before'] = df_base['cum_orders_before'].fillna(0)
-        
-        pay_returns_sorted = self.pay_returns_daily_sorted_.sort_values('return_date')
-        df_base = pd.merge_asof(
-            df_base,
-            pay_returns_sorted,
-            left_on='order_date',
-            right_on='return_date',
-            by='payment_method',
-            direction='backward',
-            allow_exact_matches=False
-        )
-        df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
-        df_base['payment_hist_return_rate'] = (df_base['cum_returns'] / df_base['cum_orders_before'].clip(lower=1)).fillna(0)
-        df_base.drop(columns=['return_date', 'cum_returns', 'cum_orders_before'], errors='ignore', inplace=True)
+            # ── 5. Target-encoded Features ────────────────────────────────────
+            # Category
+            df_base = df_base.merge(
+                self.cat_daily_orders_,
+                on=['dominant_category', 'order_date'],
+                how='left'
+            )
+            df_base['cum_orders_before'] = df_base['cum_orders_before'].fillna(0)
+            
+            cat_returns_sorted = self.cat_returns_daily_sorted_.sort_values('return_date')
+            df_base = pd.merge_asof(
+                df_base,
+                cat_returns_sorted,
+                left_on='order_date',
+                right_on='return_date',
+                by='dominant_category',
+                direction='backward',
+                allow_exact_matches=False
+            )
+            df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
+            df_base['category_hist_return_rate'] = (df_base['cum_returns'] / df_base['cum_orders_before'].clip(lower=1)).fillna(0)
+            df_base.drop(columns=['return_date', 'cum_returns', 'cum_orders_before'], errors='ignore', inplace=True)
+            
+            # Region
+            df_base = df_base.merge(
+                self.reg_daily_orders_,
+                on=['region', 'order_date'],
+                how='left'
+            )
+            df_base['cum_orders_before'] = df_base['cum_orders_before'].fillna(0)
+            
+            reg_returns_sorted = self.reg_returns_daily_sorted_.sort_values('return_date')
+            df_base = pd.merge_asof(
+                df_base,
+                reg_returns_sorted,
+                left_on='order_date',
+                right_on='return_date',
+                by='region',
+                direction='backward',
+                allow_exact_matches=False
+            )
+            df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
+            df_base['region_hist_return_rate'] = (df_base['cum_returns'] / df_base['cum_orders_before'].clip(lower=1)).fillna(0)
+            df_base.drop(columns=['return_date', 'cum_returns', 'cum_orders_before'], errors='ignore', inplace=True)
+            
+            # Payment Method
+            df_base = df_base.merge(
+                self.pay_daily_orders_,
+                on=['payment_method', 'order_date'],
+                how='left'
+            )
+            df_base['cum_orders_before'] = df_base['cum_orders_before'].fillna(0)
+            
+            pay_returns_sorted = self.pay_returns_daily_sorted_.sort_values('return_date')
+            df_base = pd.merge_asof(
+                df_base,
+                pay_returns_sorted,
+                left_on='order_date',
+                right_on='return_date',
+                by='payment_method',
+                direction='backward',
+                allow_exact_matches=False
+            )
+            df_base['cum_returns'] = df_base['cum_returns'].fillna(0)
+            df_base['payment_hist_return_rate'] = (df_base['cum_returns'] / df_base['cum_orders_before'].clip(lower=1)).fillna(0)
+            df_base.drop(columns=['return_date', 'cum_returns', 'cum_orders_before'], errors='ignore', inplace=True)
 
         # ── 6. Other features & interactions ──────────────────────────────
         df_base = df_base.merge(order_prod_hist, on='order_id', how='left')
